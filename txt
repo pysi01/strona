@@ -22,7 +22,6 @@ int sleepStartMinutes = 1320; // 22:00
 int sleepEndMinutes = 360;   // 06:00
 bool sleepEnabled = true;
 bool lastSleepActive = false;
-unsigned long lastRestart = 0;
 
 String fmtTime(int m) {
   char buf[6];
@@ -61,10 +60,12 @@ void setup() {
   relayState = prefs.getBool("relay", false);
   pinMode(relayPin, OUTPUT);
   digitalWrite(relayPin, relayState ? HIGH : LOW);
+  sleepStartMinutes = prefs.getInt("sleepStart", sleepStartMinutes);
+  sleepEndMinutes = prefs.getInt("sleepEnd", sleepEndMinutes);
+  sleepEnabled = prefs.getBool("sleepEnabled", sleepEnabled);
 
-  WiFi.mode(WIFI_AP_STA);
+  WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
-  WiFi.softAP(apSSID);
   dnsServer.start(53, "*", WiFi.softAPIP());
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
@@ -81,18 +82,23 @@ void setup() {
 
   server.begin();
   updateSleep();
-  lastRestart = millis();
 }
 
 void loop() {
   dnsServer.processNextRequest();
   updateSleep();
-  if (millis() - lastRestart >= 60000) {
-    ESP.restart();
+  if (WiFi.status() != WL_CONNECTED) {
+    WiFi.reconnect();
+    unsigned long start = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - start < 10000) {
+      delay(500);
+      yield();
+    }
   }
   WiFiClient client = server.available();
   if (client) {
     while (client.connected()) {
+      yield();
       if (client.available()) {
         String req = client.readStringUntil('\r');
         client.read();
@@ -105,6 +111,9 @@ void loop() {
           i = req.indexOf("enabled=");
           if (i != -1) sleepEnabled = req.substring(i + 8).toInt() == 1;
           updateSleep();
+          prefs.putInt("sleepStart", sleepStartMinutes);
+          prefs.putInt("sleepEnd", sleepEndMinutes);
+          prefs.putBool("sleepEnabled", sleepEnabled);
         }
 
         if (req.indexOf("/ON") != -1) setRelay(true);
