@@ -1,0 +1,582 @@
+#include <WiFi.h>
+#include <DNSServer.h>
+#include <time.h>
+#include <Preferences.h>
+
+const char* ssid = "TP-Link (ruter góra)";
+const char* password = "73127312";
+const int relayPin = 5;
+
+// Adjust these values to match your local time zone
+const long gmtOffset_sec = 2 * 3600;    // e.g. GMT+2
+const int daylightOffset_sec = 0;        // add 3600 if daylight saving is active
+
+const char* apSSID = "Panel";
+DNSServer dnsServer;
+
+WiFiServer server(80);
+Preferences prefs;
+bool relayState = false;
+
+int sleepStartMinutes = 1320; // 22:00
+int sleepEndMinutes = 360;   // 06:00
+bool sleepEnabled = true;
+bool lastSleepActive = false;
+unsigned long lastRestart = 0;
+
+String fmtTime(int m) {
+  char buf[6];
+  sprintf(buf, "%02d:%02d", m/60, m%60);
+  return String(buf);
+}
+
+bool calcSleepActive(int current) {
+  if (sleepStartMinutes < sleepEndMinutes)
+    return current >= sleepStartMinutes && current < sleepEndMinutes;
+  else
+    return current >= sleepStartMinutes || current < sleepEndMinutes;
+}
+
+void setRelay(bool on) {
+  relayState = on;
+  digitalWrite(relayPin, on ? HIGH : LOW);
+  prefs.putBool("relay", on);
+}
+
+void updateSleep() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) return;
+  int nowMin = timeinfo.tm_hour * 60 + timeinfo.tm_min;
+  bool active = false;
+  if (sleepEnabled) active = calcSleepActive(nowMin);
+  if (active != lastSleepActive) {
+    setRelay(!active);
+    lastSleepActive = active;
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  prefs.begin("cfg", false);
+  relayState = prefs.getBool("relay", false);
+  pinMode(relayPin, OUTPUT);
+  digitalWrite(relayPin, relayState ? HIGH : LOW);
+
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.begin(ssid, password);
+  WiFi.softAP(apSSID);
+  dnsServer.start(53, "*", WiFi.softAPIP());
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println("\nWiFi connected.");
+  Serial.print("IP: ");
+  Serial.println(WiFi.localIP());
+  Serial.print("AP IP: ");
+  Serial.println(WiFi.softAPIP());
+
+  configTime(gmtOffset_sec, daylightOffset_sec, "pool.ntp.org");
+
+  server.begin();
+  updateSleep();
+  lastRestart = millis();
+}
+
+void loop() {
+  dnsServer.processNextRequest();
+  updateSleep();
+  if (millis() - lastRestart >= 60000) {
+    ESP.restart();
+  }
+  WiFiClient client = server.available();
+  if (client) {
+    while (client.connected()) {
+      if (client.available()) {
+        String req = client.readStringUntil('\r');
+        client.read();
+
+        if (req.indexOf("/SET_SLEEP") != -1) {
+          int i = req.indexOf("start=");
+          if (i != -1) sleepStartMinutes = req.substring(i + 6).toInt();
+          i = req.indexOf("end=");
+          if (i != -1) sleepEndMinutes = req.substring(i + 4).toInt();
+          i = req.indexOf("enabled=");
+          if (i != -1) sleepEnabled = req.substring(i + 8).toInt() == 1;
+          updateSleep();
+        }
+
+        if (req.indexOf("/ON") != -1) setRelay(true);
+        if (req.indexOf("/OFF") != -1) setRelay(false);
+
+
+        client.println("HTTP/1.1 200 OK");
+        client.println("Content-Type: text/html");
+        client.println("Connection: close\n");
+        client.println();
+
+        String page = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>ESP32 Przełączniki</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <style>
+    html, body {
+      margin: 0;
+      font-family: sans-serif;
+      text-align: center;
+      background: black;
+      color: white;
+      padding-top: 30px;
+      scroll-behavior: smooth;
+    }
+    #background {
+      position: fixed;
+      width: 100%;
+      height: 100%;
+      z-index: 1;
+      pointer-events: none;
+      background: transparent;
+      overflow: hidden;
+    }
+    .x {
+      position: absolute;
+      color: white;
+      font-size: 10px;
+      font-weight: bold;
+      filter: drop-shadow(0 0 3px white);
+      animation: float 15s linear infinite;
+      will-change: transform;
+    }
+    .circle {
+      position: absolute;
+      width: 10px;
+      height: 10px;
+      border: 2px solid white;
+      border-radius: 50%;
+      filter: drop-shadow(0 0 3px white);
+      background: transparent;
+      animation: float 15s linear infinite;
+      will-change: transform;
+    }
+    .triangle {
+      position: absolute;
+      color: white;
+      font-size: 10px;
+      font-weight: bold;
+      filter: drop-shadow(0 0 3px white);
+      animation: float 15s linear infinite;
+      will-change: transform;
+    }
+    @keyframes float {
+      0% {
+        transform: translateY(100vh) rotate(0deg);
+        opacity: 1;
+      }
+      100% {
+        transform: translateY(-10vh) rotate(360deg);
+        opacity: 0;
+      }
+    }
+    .switch {
+      position: relative;
+      display: inline-block;
+      width: 120px;
+      height: 60px;
+      margin: 20px;
+    }
+    .switch input {
+      opacity: 0;
+      width: 0;
+      height: 0;
+    }
+    .slider {
+      position: absolute;
+      cursor: pointer;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      background-color: #ccc;
+      transition: .4s;
+      border-radius: 60px;
+    }
+    @keyframes glowPulse {
+      0%, 100% { box-shadow: 0 0 5px #4CAF50; }
+      50% { box-shadow: 0 0 15px #4CAF50; }
+    }
+    @keyframes shake {
+      0%, 100% { transform: translate(0, 0); }
+      25% { transform: translate(-2px, -2px); }
+      50% { transform: translate(2px, 2px); }
+      75% { transform: translate(-2px, 2px); }
+    }
+    .slider:before {
+      position: absolute;
+      content: "";
+      height: 52px;
+      width: 52px;
+      left: 4px;
+      bottom: 4px;
+      background-color: white;
+      transition: .4s;
+      border-radius: 50%;
+    }
+    input:checked + .slider {
+      background-color: #4CAF50;
+      box-shadow: 0 0 20px #4CAF50;
+      animation: shake 1s infinite;
+    }
+    input:checked + .slider:before {
+      transform: translateX(60px);
+      box-shadow: 0 0 20px #4CAF50;
+    }
+    .label {
+      font-size: 20px;
+      margin-bottom: 10px;
+    }
+    .slider-container {
+      position: relative;
+      margin-top: 10px;
+      width: 80%;
+      max-width: 400px;
+      margin-left: auto;
+      margin-right: auto;
+      z-index: 2;
+      height: 32px;
+    }
+    .slider-container::before {
+      content: "";
+      position: absolute;
+      top: 50%;
+      left: 0;
+      width: 100%;
+      height: 8px;
+      background: #555;
+      border-radius: 4px;
+      transform: translateY(-50%);
+      z-index: 0;
+    }
+    .slider-container .progress {
+      position: absolute;
+      top: 50%;
+      left: 0;
+      height: 8px;
+      transform: translateY(-50%);
+      background: #fff;
+      border-radius: 4px;
+      width: 0%;
+      box-shadow: 0 0 5px #fff;
+      pointer-events: none;
+      z-index: 1;
+    }
+    input[type=range] {
+      -webkit-appearance: none;
+      width: 100%;
+      height: 8px;
+      outline: none;
+      background: none;
+      border-radius: 4px;
+      position: absolute;
+      top: 50%;
+      left: 0;
+      transform: translateY(-50%);
+      z-index: 2;
+    }
+    input[type=range]::-webkit-slider-runnable-track {
+      width: 100%;
+      height: 8px;
+      cursor: pointer;
+      background: none;
+      border-radius: 4px;
+    }
+    input[type=range]::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      appearance: none;
+      width: 20px;
+      height: 20px;
+      border-radius: 50%;
+      background: #fff;
+      cursor: pointer;
+      box-shadow: 0 0 5px #fff;
+      margin-top: -7px;
+    }
+    input[type=range]::-moz-range-track {
+      width: 100%;
+      height: 8px;
+      cursor: pointer;
+      background: none;
+      border-radius: 4px;
+    }
+    input[type=range]::-moz-range-progress {
+      background: none;
+      height: 8px;
+      border-radius: 4px;
+    }
+    input[type=range]::-moz-range-thumb {
+      width: 20px;
+      height: 20px;
+      border-radius: 50%;
+      background: #fff;
+      cursor: pointer;
+      box-shadow: 0 0 5px #fff;
+      border: none;
+      transform: translateY(-3px);
+    }
+    .value {
+      margin-top: 5px;
+      font-size: 16px;
+      color: #aaa;
+    }
+    .num-input {
+      margin-top: 5px;
+      width: 80px;
+      padding: 4px;
+      font-size: 16px;
+      text-align: center;
+      border-radius: 4px;
+      border: 1px solid #666;
+      background: #222;
+      color: #fff;
+    }
+    input[type=number]::-webkit-inner-spin-button,
+    input[type=number]::-webkit-outer-spin-button {
+      -webkit-appearance: none;
+      margin: 0;
+    }
+    .tabs {
+      display: flex;
+      justify-content: center;
+      border-bottom: 1px solid #666;
+      background: transparent;
+      padding: 5px 0;
+    }
+    .tab {
+      padding: 5px 15px;
+      cursor: pointer;
+      color: white;
+      background: none;
+      border: none;
+      font-size: 16px;
+      border-bottom: 2px solid transparent;
+    }
+    .tab.active {
+      border-bottom-color: white;
+    }
+    .tab-content {
+      display: none;
+      opacity: 0;
+      transition: opacity 0.5s;
+    }
+    .tab-content.active {
+      display: block;
+      opacity: 1;
+    }
+  </style>
+</head>
+<body>
+  <div id="background"></div>
+  <div class="tabs">
+    <button class="tab active" data-tab="home">Strona główna</button>
+    <button class="tab" data-tab="sen">Sen</button>
+  </div>
+
+  <div id="home" class="tab-content active">
+    <h1>ESP32 Przełączniki</h1>
+
+    <div class="label">Standardowy przełącznik</div>
+    <label class="switch">
+      <input type="checkbox" id="toggle">
+      <span class="slider"></span>
+    </label>
+
+  </div>
+
+  <div id="sen" class="tab-content">
+    <h1>Sen</h1>
+
+    <div class="label">Tryb nocny</div>
+    <label class="switch">
+      <input type="checkbox" id="sleepToggle" %ENABLED%>
+      <span class="slider"></span>
+    </label>
+
+    <div class="label">Początek snu</div>
+    <div class="slider-container">
+      <div class="progress" id="sleepStartProg"></div>
+      <input type="range" id="sleepStart" min="0" max="1439" step="1" value="%START%">
+    </div>
+    <input class="num-input" type="time" step="60" id="sleepStartInput" value="%STARTFMT%">
+    <div class="value" id="sleepStartValue">%STARTFMT%</div>
+    <div class="label">Koniec snu</div>
+    <div class="slider-container">
+      <div class="progress" id="sleepEndProg"></div>
+      <input type="range" id="sleepEnd" min="0" max="1439" step="1" value="%END%">
+    </div>
+    <input class="num-input" type="time" step="60" id="sleepEndInput" value="%ENDFMT%">
+    <div class="value" id="sleepEndValue">%ENDFMT%</div>
+    <div class="value" id="sleepRangeValue">%STARTFMT% - %ENDFMT%</div>
+  </div>
+
+  <script>
+    const tabs = document.querySelectorAll('.tab');
+    const contents = document.querySelectorAll('.tab-content');
+    tabs.forEach(tab => {
+      tab.addEventListener('click', () => {
+        if (tab.classList.contains('active')) return;
+        const target = document.getElementById(tab.dataset.tab);
+        const current = document.querySelector('.tab-content.active');
+
+        tabs.forEach(t => t.classList.remove('active'));
+        tab.classList.add('active');
+
+        target.style.display = 'block';
+        requestAnimationFrame(() => target.classList.add('active'));
+
+        current.classList.remove('active');
+        setTimeout(() => {
+          if (!current.classList.contains('active')) current.style.display = 'none';
+        }, 500);
+      });
+    });
+
+    const toggle = document.getElementById("toggle");
+
+
+    toggle.addEventListener("change", function () {
+      fetch(this.checked ? "/ON" : "/OFF");
+    });
+
+    function updateSliderBg(el, bar) {
+      const percent = (el.value - el.min) / (el.max - el.min) * 100;
+      bar.style.width = percent + '%';
+      const glow = 5 + percent * 0.2;
+      bar.style.boxShadow = `0 0 ${glow}px #fff`;
+    }
+
+
+
+    const sleepToggle = document.getElementById("sleepToggle");
+    const sleepStart = document.getElementById("sleepStart");
+    const sleepEnd = document.getElementById("sleepEnd");
+    const sleepStartInput = document.getElementById("sleepStartInput");
+    const sleepEndInput = document.getElementById("sleepEndInput");
+    const sleepStartProg = document.getElementById("sleepStartProg");
+    const sleepEndProg = document.getElementById("sleepEndProg");
+    const sleepStartValue = document.getElementById("sleepStartValue");
+    const sleepEndValue = document.getElementById("sleepEndValue");
+    const sleepRangeValue = document.getElementById("sleepRangeValue");
+
+    function formatTime(m) {
+      const h = Math.floor(m / 60);
+      const mi = m % 60;
+      return h.toString().padStart(2, '0') + ':' + mi.toString().padStart(2, '0');
+    }
+
+    function updateSleepDisplay() {
+      sleepStartValue.innerText = formatTime(sleepStart.value);
+      sleepEndValue.innerText = formatTime(sleepEnd.value);
+      sleepRangeValue.innerText = `${formatTime(sleepStart.value)} - ${formatTime(sleepEnd.value)}`;
+    }
+
+
+    function sendSleepSettings() {
+      fetch(`/SET_SLEEP?start=${sleepStart.value}&end=${sleepEnd.value}&enabled=${sleepToggle.checked ? 1 : 0}`);
+    }
+
+    function updateSleepSlider() {
+      updateSliderBg(sleepStart, sleepStartProg);
+      updateSliderBg(sleepEnd, sleepEndProg);
+      sleepStartInput.value = formatTime(sleepStart.value);
+      sleepEndInput.value = formatTime(sleepEnd.value);
+      updateSleepDisplay();
+    }
+
+    sleepStart.addEventListener('input', updateSleepSlider);
+    sleepEnd.addEventListener('input', updateSleepSlider);
+    function parseTimeStr(s) {
+      const p = s.split(':');
+      if (p.length !== 2) return NaN;
+      const h = parseInt(p[0]);
+      const m = parseInt(p[1]);
+      if (isNaN(h) || isNaN(m)) return NaN;
+      return h * 60 + m;
+    }
+
+    sleepStartInput.addEventListener('input', function() {
+      const v = parseTimeStr(this.value);
+      if (isNaN(v)) return;
+      sleepStart.value = v;
+      updateSleepSlider();
+    });
+    sleepEndInput.addEventListener('input', function() {
+      const v = parseTimeStr(this.value);
+      if (isNaN(v)) return;
+      sleepEnd.value = v;
+      updateSleepSlider();
+    });
+    sleepStart.addEventListener('change', sendSleepSettings);
+    sleepEnd.addEventListener('change', sendSleepSettings);
+    sleepStartInput.addEventListener('change', sendSleepSettings);
+    sleepEndInput.addEventListener('change', sendSleepSettings);
+    sleepToggle.addEventListener('change', sendSleepSettings);
+    updateSleepSlider();
+    sendSleepSettings();
+
+    const background = document.getElementById("background");
+    for (let i = 0; i < 20; i++) {
+      const x = document.createElement("div");
+      x.classList.add("x");
+      x.textContent = "✕";
+      x.style.left = `${Math.random() * 100}%`;
+      x.style.top = `${Math.random() * 100}%`;
+      x.style.fontSize = `${8 + Math.random() * 20}px`;
+      x.style.animationDuration = `${5 + Math.random() * 10}s`;
+      background.appendChild(x);
+    }
+    for (let i = 0; i < 15; i++) {
+      const c = document.createElement("div");
+      c.classList.add("circle");
+      const size = 8 + Math.random() * 20;
+      c.style.width = `${size}px`;
+      c.style.height = `${size}px`;
+      c.style.left = `${Math.random() * 100}%`;
+      c.style.top = `${Math.random() * 100}%`;
+      c.style.animationDuration = `${5 + Math.random() * 10}s`;
+      background.appendChild(c);
+    }
+    for (let i = 0; i < 15; i++) {
+      const t = document.createElement("div");
+      t.classList.add("triangle");
+      t.textContent = "\u25B3"; // white up-pointing triangle
+      t.style.left = `${Math.random() * 100}%`;
+      t.style.top = `${Math.random() * 100}%`;
+      t.style.fontSize = `${8 + Math.random() * 20}px`;
+      t.style.animationDuration = `${5 + Math.random() * 10}s`;
+      background.appendChild(t);
+    }
+  </script>
+</body>
+</html>
+)rawliteral";
+
+        page.replace("%ENABLED%", sleepEnabled ? "checked" : "");
+        page.replace("%START%", String(sleepStartMinutes));
+        page.replace("%END%", String(sleepEndMinutes));
+        String sTime = fmtTime(sleepStartMinutes);
+        String eTime = fmtTime(sleepEndMinutes);
+        page.replace("%STARTFMT%", sTime);
+        page.replace("%ENDFMT%", eTime);
+
+        client.println(page);
+
+        break;
+      }
+    }
+    delay(1);
+    client.stop();
+  }
+}
