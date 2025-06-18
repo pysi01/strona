@@ -395,6 +395,7 @@ void loop() {
 
   <div id="home" class="tab-content active">
     <h1>ESP32 Przełączniki</h1>
+    <div id="wifiStatus" class="value">%WIFISTATUS%</div>
 
     <div class="label">Standardowy przełącznik</div>
     <label class="switch">
@@ -579,6 +580,8 @@ void loop() {
         String eTime = fmtTime(sleepEndMinutes);
         page.replace("%STARTFMT%", sTime);
         page.replace("%ENDFMT%", eTime);
+        String wifiStatusStr = WiFi.status() == WL_CONNECTED ? "Po\u0142\u0105czono z WiFi" : "Brak po\u0142\u0105czenia WiFi";
+        page.replace("%WIFISTATUS%", wifiStatusStr);
 
         client.println(page);
 
